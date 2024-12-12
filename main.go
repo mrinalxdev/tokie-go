@@ -6,16 +6,25 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"sort"
 	"strings"
 	"sync"
+	"text/tabwriter"
+	"time"
 )
 
 type LanguageStas struct {
 	FileCount int
 	LineCount int
-	mutex sync.Mutex
+	ByteCount int64
+	mutex     sync.Mutex
 }
 
+type FileResult struct {
+	path     string
+	language string
+}
 
 var languageExtMap = map[string]string{
 	".go":    "Go",
@@ -32,125 +41,143 @@ var languageExtMap = map[string]string{
 	".kt":    "Kotlin",
 }
 
-func main(){
+func main() {
+	startTime := time.Now()
+
 	excludePtr := flag.String("exclude", "", "Comma-separated list of file pattern to exclude (eg. '*.json, *.yml')")
 	flag.Parse()
 
-	excludePatterns := []string{}
-	if *excludePtr != "" {
-		excludePatterns = strings.Split(*excludePtr, ",")
-		for i, pattern := range excludePatterns {
-			excludePatterns[i] = strings.TrimSpace(pattern)
-		}
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		fmt.Printf("Error getting home directory : %v\n", err)
+		os.Exit(1)
+	}
+	desktopPath := filepath.Join(homeDir, "Desktop")
+
+	// process exclude patterns
+	excludePatterns := strings.Split(*excludePtr, ",")
+	if *excludePtr == "" {
+		excludePatterns = nil
 	}
 
 	stats := make(map[string]*LanguageStas)
 	var statsMutex sync.Mutex
 
-	startDir, err := os.Getwd()
-	if err != nil {
-		fmt.Printf("Error getting current directory : %v\n", err)
-		os.Exit(1)
+	// creating channels for the pipelines
+	filesChan := make(chan FileResult, 1000)
+	done := make(chan bool)
+	numWorkers := runtime.NumCPU()
+
+	var wg sync.WaitGroup
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for result := range filesChan {
+				processFile(result.path, result.language, stats, &statsMutex)
+			}
+		}()
 	}
 
-	// waitgroups for goroutines
-	var wg sync.WaitGroup
-
-	// process files
-	err = filepath.Walk(startDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-
-		if info.IsDir(){
-			return nil
-		}
-
-		// checking for excluded file flags to know it should be skipped 
-		for _, pattern := range excludePatterns {
-			matched, err := filepath.Match(pattern, filepath.Base(path))
+	// file discovery goroutine
+	go func() {
+		err := filepath.Walk(desktopPath, func(path string, info os.FileInfo, err error) error {
 			if err != nil {
-				fmt.Println("Error matching pattern %s: %v\n", pattern, err)
-				continue
+				return err
 			}
-			if matched {
+
+			if info.IsDir() {
 				return nil
 			}
+
+			for _, pattern := range excludePatterns {
+				matched, err := filepath.Match(strings.TrimSpace(pattern), filepath.Base(path))
+				if err != nil || matched {
+					return nil
+				}
+			}
+
+			ext := strings.ToLower(filepath.Ext(path))
+			if lang, ok := languageExtMap[ext]; ok {
+				filesChan <- FileResult{path: path, language: lang}
+			}
+
+			return nil
+		})
+		if err != nil {
+			fmt.Printf("Error walking directort : %v\n", err)
 		}
 
-		ext := strings.ToLower(filepath.Ext(path))
-		if lang, ok := languageExtMap[ext]; ok {
-			wg.Add(1)
-			go func(filePath, language string){
-				defer wg.Done()
+		close(filesChan)
+	}()
 
-				// counting the line in the file for the respective the code
-				// todo : will be adding logic to ignore the commencts
-				lineCount, err := countLines(filePath)
-				if err != nil {
-					fmt.Println("Error counting lines in %s: %v\n", filePath, err)
-					return
-				}
-
-				statsMutex.Lock()
-				if _, exists := stats[language]; !exists {
-					stats[language] = &LanguageStas{}
-				}
-				stats[language].mutex.Lock()
-				stats[language].FileCount++
-				stats[language].LineCount += lineCount
-				stats[language].mutex.Unlock()
-				statsMutex.Unlock()
-			}(path, lang)
-		}
-		return nil
-	})
-
-	if err != nil {
-		fmt.Printf("Error walking directory : %v\n", err)
-		os.Exit(1)
-	}
-
-
-	// goroutines to end
+	// waiting for all the workers to complete their allocated work
 	wg.Wait()
-	fmt.Println("\n Code stats")
+	close(done)
+
+	languages := make([]string, 0, len(stats))
+	for lang := range stats {
+		languages = append(languages, lang)
+	}
+	sort.Strings(languages)
+
+	// tablewriter package
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', tabwriter.TabIndent)
+	fmt.Fprintf(w, "\n Code Report \n \n")
+	fmt.Fprintf(w, "Language\tFiles\tLines\tSize (KB)\t\n")
+	fmt.Fprintf(w, "--------\t-----\t-----\t---------\t\n")
+
 	totalFiles := 0
 	totalLines := 0
+	totalSize := int64(0)
 
-	for lang, stat := range stats {
+	for _, lang := range languages {
+		stat := stats[lang]
 		totalFiles += stat.FileCount
 		totalLines += stat.LineCount
-		fmt.Printf("\n %:\n", lang)
-		fmt.Printf(" Files : %d\n", stat.FileCount)
-		fmt.Printf(" Lines of Code : %d\n", stat.LineCount)
+		totalSize += stat.ByteCount
+		fmt.Fprintf(w, "%s\t%d\t%d\t%.2f\t\n", lang, stat.FileCount, stat.LineCount, float64(stat.ByteCount)/1024) // dividing by 1024 to get the KB.
 	}
 
-	fmt.Println("\n Summary")
-	fmt.Println("=============")
-	fmt.Printf("Total Files Scanned : %d\n", totalFiles)
-	fmt.Printf("Total Lines of Code : %d\n", totalLines)
+	fmt.Fprintf(w, "--------\t-----\t-----\t---------\t\n")
+	fmt.Fprintf(w, "Total\t%d\t%d\t%.2f\t\n", totalFiles, totalLines, float64(totalSize)/1024)
+	w.Flush()
 
+	fmt.Printf("\n Execution Time : %.2f seconds\n", time.Since(startTime).Seconds())
 	if len(excludePatterns) > 0 {
-		fmt.Println("\n Excluded Patterns:")
+		fmt.Println("\n Excluded Patterns :")
 		for _, pattern := range excludePatterns {
-			fmt.Printf("    -> %s\n", pattern)
+			if pattern != ""{
+				fmt.Printf("   • %s\n", strings.TrimSpace(pattern))
+			}
 		}
 	}
 }
 
-func countLines(filePath string) (int, error){
-	file, err := os.Open(filePath)
+func processFile(path, language string, stats map[string]*LanguageStas, statsMutex *sync.Mutex) {
+	file, err := os.Open(path)
 	if err != nil {
-		return 0, err
+		return
 	}
 	defer file.Close()
 
+	info, err := file.Stat()
+	if err != nil {
+		return
+	}
+
 	scanner := bufio.NewScanner(file)
 	lineCount := 0
-	for scanner.Scan(){
+	for scanner.Scan() {
 		lineCount++
 	}
 
-	return lineCount, scanner.Err()
+	statsMutex.Lock()
+	if _, exists := stats[language]; !exists {
+		stats[language] = &LanguageStas{}
+	}
+	stats[language].FileCount++
+	stats[language].LineCount += lineCount
+	stats[language].ByteCount += info.Size()
+	statsMutex.Unlock()
 }
